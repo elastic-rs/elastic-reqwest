@@ -159,9 +159,99 @@ extern crate url;
 use std::io::Cursor;
 use std::collections::BTreeMap;
 use std::str;
+use std::fmt;
+use std::error::Error as StdError;
 use reqwest::header::{Header, HeaderFormat, Headers, ContentType};
 use reqwest::{RequestBuilder, Response};
 use url::form_urlencoded::Serializer;
+
+#[derive(Debug)]
+struct BodyError(Box<StdError + Send + Sync + 'static>);
+
+impl StdError for BodyError {
+    fn description(&self) -> &str {
+        self.0.description()
+    }
+
+    fn cause(&self) -> Option<&StdError> {
+        self.0.cause()
+    }
+}
+
+impl fmt::Display for BodyError {
+    fn fmt(&self, f: &mut fmt::Formatter) -> fmt::Result {
+        fmt::Display::fmt(&self.0, f)
+    }
+}
+
+#[derive(Debug)]
+enum ErrorKind {
+    Body(BodyError),
+    Reqwest(reqwest::Error),
+}
+
+/// An error produced while constructing or sending a HTTP request.
+#[derive(Debug)]
+pub struct Error {
+    inner: ErrorKind,
+}
+
+impl Error {
+    fn http(err: reqwest::Error) -> Error {
+        Error {
+            inner: ErrorKind::Reqwest(err)
+        }
+    }
+
+    fn body<E>(err: E) -> Error where E: StdError + Send + Sync + 'static {
+        Error {
+            inner: ErrorKind::Body(BodyError(Box::new(err)))
+        }
+    }
+}
+
+impl Error {
+    /// Check if this error is caused by building the request body.
+    pub fn is_body(&self) -> bool {
+        match self.inner {
+            ErrorKind::Body(_) => true,
+            _ => false
+        }
+    }
+
+    /// Check if this error is caused by sending the http request.
+    pub fn is_http(&self) -> bool {
+        match self.inner {
+            ErrorKind::Reqwest(_) => true,
+            _ => false
+        }
+    }
+}
+
+impl StdError for Error {
+    fn description(&self) -> &str {
+        match self.inner {
+            ErrorKind::Body(_) => "Error building request body",
+            ErrorKind::Reqwest(_) => "Error sending HTTP request",
+        }
+    }
+
+    fn cause(&self) -> Option<&StdError> {
+        match self.inner {
+            ErrorKind::Body(ref err) => Some(err),
+            ErrorKind::Reqwest(ref err) => Some(err),
+        }
+    }
+}
+
+impl fmt::Display for Error {
+    fn fmt(&self, f: &mut fmt::Formatter) -> fmt::Result {
+        match self.inner {
+            ErrorKind::Body(ref err) => fmt::Display::fmt(err, f),
+            ErrorKind::Reqwest(ref err) => fmt::Display::fmt(err, f),
+        }
+    }
+}
 
 /// Request types.
 /// 
@@ -308,58 +398,92 @@ pub fn default() -> Result<(reqwest::Client, RequestParams), reqwest::Error> {
 }
 
 /// A type that can be converted into a `reqwest::Body`.
-pub trait IntoReqwestBody {
+/// 
+/// # Examples
+/// 
+/// Implement `IntoBody` for a custom type to convert it into a
+/// request body:
+/// 
+/// ```
+/// # extern crate elastic_reqwest;
+/// # extern crate reqwest;
+/// # fn main() {
+/// # use std::io::Error as SerError;
+/// # use elastic_reqwest::IntoBody;
+/// use reqwest::Body;
+/// 
+/// struct CustomBody;
+/// # impl CustomBody {
+/// # fn serialize(&self) -> Result<Vec<u8>, SerError> { Ok(vec![]) }
+/// # }
+/// 
+/// impl IntoBody for CustomBody {
+///     type Error = SerError;
+///     fn into_body(self) -> Result<Body, Self::Error> {
+///         self.serialize().map(|buf| buf.into())
+///     }
+/// }
+/// # }
+/// ```
+pub trait IntoBody {
+    /// The error type produced by this conversion.
+    type Error: StdError + Send + Sync + 'static;
+
     /// Convert self into a body.
-    fn into_body(self) -> reqwest::Body;
+    fn into_body(self) -> Result<reqwest::Body, Self::Error>;
 }
 
-impl<B: Into<reqwest::Body>> IntoReqwestBody for B {
+impl<B: Into<reqwest::Body>> IntoBody for B {
+    type Error = reqwest::Error;
+
     #[cfg(feature = "nightly")]
-    default fn into_body(self) -> reqwest::Body {
-        self.into()
+    default fn into_body(self) -> Result<reqwest::Body, Self::Error> {
+        Ok(self.into())
     }
 
     #[cfg(not(feature = "nightly"))]
-    fn into_body(self) -> reqwest::Body {
-        self.into()
+    fn into_body(self) -> Result<reqwest::Body, Self::Error> {
+        Ok(self.into())
     }
 }
 
 #[cfg(feature = "nightly")]
-impl IntoReqwestBody for &'static [u8] {
-    fn into_body(self) -> reqwest::Body {
-        reqwest::Body::new(Cursor::new(self))
+impl IntoBody for &'static [u8] {
+    fn into_body(self) -> Result<reqwest::Body, Self::Error> {
+        Ok(reqwest::Body::new(Cursor::new(self)))
     }
 }
 
 #[cfg(feature = "nightly")]
-impl IntoReqwestBody for &'static str {
-    fn into_body(self) -> reqwest::Body {
-        reqwest::Body::new(Cursor::new(self))
+impl IntoBody for &'static str {
+    fn into_body(self) -> Result<reqwest::Body, Self::Error> {
+        Ok(reqwest::Body::new(Cursor::new(self)))
     }
 }
 
 /// Represents a client that can send Elasticsearch requests.
 pub trait ElasticClient {
     /// Send a request and get a response.
-    fn elastic_req<I, B>(&self, params: &RequestParams, req: I) -> Result<Response, reqwest::Error> 
+    fn elastic_req<I, B>(&self, params: &RequestParams, req: I) -> Result<Response, Error>
         where I: Into<HttpRequest<'static, B>>,
-              B: IntoReqwestBody;
+              B: IntoBody;
 }
 
 macro_rules! req_with_body {
     ($client:ident, $url:ident, $body:ident, $params:ident, $method:ident) => ({
         let body = $body.expect("Expected this request to have a body. This is a bug, please file an issue on GitHub.");
 
+        let body = body.into_body().map_err(Error::body)?;
+
         $client.request(reqwest::Method::$method, &$url)
                .headers($params.headers.to_owned())
-               .body(body.into_body())
+               .body(body)
     })
 }
 
-fn build_req<I, B>(client: &reqwest::Client, params: &RequestParams, req: I) -> RequestBuilder 
+fn build_req<I, B>(client: &reqwest::Client, params: &RequestParams, req: I) -> Result<RequestBuilder, Error> 
     where I: Into<HttpRequest<'static, B>>,
-          B: IntoReqwestBody
+          B: IntoBody
 {
     let req = req.into();
 
@@ -377,7 +501,7 @@ fn build_req<I, B>(client: &reqwest::Client, params: &RequestParams, req: I) -> 
     let method = req.method;
     let body = req.body;
 
-    match method {
+    let req = match method {
         HttpMethod::Get => client.get(&url).headers(params.headers.to_owned()),
 
         HttpMethod::Post => req_with_body!(client, url, body, params, Post),
@@ -389,15 +513,17 @@ fn build_req<I, B>(client: &reqwest::Client, params: &RequestParams, req: I) -> 
         HttpMethod::Put => req_with_body!(client, url, body, params, Put),
         
         HttpMethod::Patch => req_with_body!(client, url, body, params, Patch),
-    }
+    };
+
+    Ok(req)
 }
 
 impl ElasticClient for reqwest::Client {
-    fn elastic_req<I, B>(&self, params: &RequestParams, req: I) -> Result<Response, reqwest::Error>
+    fn elastic_req<I, B>(&self, params: &RequestParams, req: I) -> Result<Response, Error>
         where I: Into<HttpRequest<'static, B>>,
-              B: IntoReqwestBody
+              B: IntoBody
     {
-        build_req(&self, params, req).send()
+        build_req(&self, params, req)?.send().map_err(Error::http)
     }
 }
 
@@ -430,7 +556,7 @@ mod tests {
     #[test]
     fn head_req() {
         let cli = Client::new().unwrap();
-        let req = build_req(&cli, &params(), PingHeadRequest::new());
+        let req = build_req(&cli, &params(), PingHeadRequest::new()).unwrap();
 
         let url = "eshost:9200/path/?pretty=true&q=*";
 
@@ -442,7 +568,7 @@ mod tests {
     #[test]
     fn get_req() {
         let cli = Client::new().unwrap();
-        let req = build_req(&cli, &params(), SimpleSearchRequest::new());
+        let req = build_req(&cli, &params(), SimpleSearchRequest::new()).unwrap();
 
         let url = "eshost:9200/path/_search?pretty=true&q=*";
 
@@ -454,7 +580,7 @@ mod tests {
     #[test]
     fn post_req() {
         let cli = Client::new().unwrap();
-        let req = build_req(&cli, &params(), PercolateRequest::for_index_ty("idx", "ty", vec![]));
+        let req = build_req(&cli, &params(), PercolateRequest::for_index_ty("idx", "ty", vec![])).unwrap();
 
         let url = "eshost:9200/path/idx/ty/_percolate?pretty=true&q=*";
 
@@ -466,7 +592,7 @@ mod tests {
     #[test]
     fn put_req() {
         let cli = Client::new().unwrap();
-        let req = build_req(&cli, &params(), IndicesCreateRequest::for_index("idx", vec![]));
+        let req = build_req(&cli, &params(), IndicesCreateRequest::for_index("idx", vec![])).unwrap();
 
         let url = "eshost:9200/path/idx?pretty=true&q=*";
 
@@ -478,7 +604,7 @@ mod tests {
     #[test]
     fn delete_req() {
         let cli = Client::new().unwrap();
-        let req = build_req(&cli, &params(), IndicesDeleteRequest::for_index("idx"));
+        let req = build_req(&cli, &params(), IndicesDeleteRequest::for_index("idx")).unwrap();
 
         let url = "eshost:9200/path/idx?pretty=true&q=*";
 
@@ -489,24 +615,24 @@ mod tests {
 
     #[test]
     fn owned_string_into_body() {
-        String::new().into_body();
+        String::new().into_body().unwrap();
     }
 
     #[test]
     fn borrowed_string_into_body() {
-        "abc".into_body();
+        "abc".into_body().unwrap();
     }
 
     #[test]
     fn owned_vec_into_body() {
-        Vec::new().into_body();
+        Vec::new().into_body().unwrap();
     }
 
     #[test]
     fn borrowed_vec_into_body() {
         static BODY: &'static [u8] = &[0, 1, 2];
 
-        (&BODY).into_body();
+        (&BODY).into_body().unwrap();
     }
 
     #[test]
