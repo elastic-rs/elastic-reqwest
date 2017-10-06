@@ -1,16 +1,8 @@
 sudo: false
-language: rust
-
-matrix:
-  include:
-    - rust: stable
-      env:
-        - CHANNEL="stable"
-    - rust: nightly
-      env:
-        - CHANNEL="nightly"
 
 script:
   - |
-      cargo test &&
-      if [ "$CHANNEL" == "nightly" ]; then cargo bench; fi
+      echo 'nothing to see here'
+
+notifications:
+  email: false
